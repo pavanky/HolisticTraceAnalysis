@@ -21,8 +21,10 @@ class TraceParseTestCase(unittest.TestCase):
         super(TraceParseTestCase, cls).setUpClass()
         vision_transformer_trace_dir: str = "tests/data/vision_transformer"
         inference_trace_dir: str = "tests/data/inference_single_rank"
+        # inference_trace_dir: str = "../../load_benchmarks/python_func_ops_example"
         vision_transformer_rank_0_file: str = "rank-0.json.gz"
         inference_rank_0_file: str = "inference_rank_0.json.gz"
+        # inference_rank_0_file: str = "rank-1.Jan_17_19_32_44.5411.pt.trace.json.gz"
         max_ranks = 8
 
         # Trace parser for vision transformer

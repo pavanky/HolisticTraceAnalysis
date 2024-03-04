@@ -15,6 +15,8 @@ import time
 import tracemalloc
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import ijson
+
 import pandas as pd
 
 from hta.common.trace_file import get_trace_files
@@ -22,6 +24,8 @@ from hta.configs.config import logger
 from hta.configs.default_values import DEFAULT_TRACE_DIR
 from hta.configs.parser_config import AttributeSpec, ParserConfig, ValueType
 from hta.utils.utils import get_mp_pool_size, normalize_path, shorten_name
+
+# from memory_profiler import profile
 
 MetaData = Dict[str, Any]
 PHASE_COUNTER: str = "C"
@@ -164,6 +168,7 @@ class TraceSymbolTable:
         )
 
 
+# @profile
 def parse_trace_dict(trace_file_path: str) -> Dict[str, Any]:
     """
     Parse a raw trace file into a dictionary.
@@ -187,8 +192,88 @@ def parse_trace_dict(trace_file_path: str) -> Dict[str, Any]:
             f"expect the value of trace_file ({trace_file_path}) ends with '.gz' or 'json'"
         )
     t_end = time.perf_counter()
-    logger.info(f"Parsed {trace_file_path} time = {(t_end - t_start):.2f} seconds ")
+    logger.warning(f"Parsed {trace_file_path} time = {(t_end - t_start):.2f} seconds ")
     return trace_record
+
+
+# @profile
+def parse_trace_events_ijson(trace_file_path: str) -> pd.DataFrame:
+    t_start = time.perf_counter()
+    with (
+        gzip.open(trace_file_path, "rb")
+        if trace_file_path.endswith(".gz")
+        else open(trace_file_path, "r")
+    ) as fh:
+
+        iterator = ijson.items(fh, "traceEvents.item", use_float=True)
+
+        # this version ignore python function tracer
+        df = pd.DataFrame(e for e in iterator if e.get("cat") != "python_function")
+        # df = pd.DataFrame(iterator)
+
+    t_end = time.perf_counter()
+    logger.warning(
+        f"Parsed (ijson) {trace_file_path} time = {(t_end - t_start):.2f} seconds "
+    )
+    return df
+
+
+def parse_trace_events_ijson_batched(
+    trace_file_path: str, cfg: ParserConfig, compress_on_fly: bool = False
+) -> pd.DataFrame:
+
+    arg_name_map = {arg.raw_name: arg.name for arg in cfg.get_args()}
+    args_to_keep = arg_name_map.keys()
+    # logger.warning(f"arg_name_map = {arg_name_map}")
+
+    def trim_event(e):
+        if "args" not in e:
+            return e
+        for arg, val in e["args"].items():
+            if arg in args_to_keep:
+                e[arg_name_map[arg]] = val
+        e.pop("args", None)
+        return e
+
+    df = pd.DataFrame()
+
+    t_start = time.perf_counter()
+    with (
+        gzip.open(trace_file_path, "rb")
+        if trace_file_path.endswith(".gz")
+        else open(trace_file_path, "r")
+    ) as fh:
+
+        iterator = (
+            e
+            for e in ijson.items(fh, "traceEvents.item", use_float=True)
+            if e.get("cat") != "python_function"
+        )
+        if compress_on_fly:
+            iterator = (trim_event(e) for e in iterator)
+
+        batch_size = 1000
+        batch = []
+        dfs = []
+
+        # Iterate over filtered dictionaries and append to DataFrame in batches
+        for item in iterator:
+            batch.append(item)
+            if len(batch) == batch_size:
+                dfs.append(pd.DataFrame(batch))
+                batch = []
+
+        # Append remaining items if any
+        if batch:
+            dfs.append(pd.DataFrame(batch))
+
+        df = pd.concat(dfs, ignore_index=True)
+
+    t_end = time.perf_counter()
+    logger.warning(
+        f"Parsed (ijson) {trace_file_path} time = {(t_end - t_start):.2f} seconds "
+    )
+    return df
 
 
 def compress_df(
@@ -228,16 +313,17 @@ def compress_df(
         logger.info(f"counter_names={counter_names}")
         logger.info(f"args={cfg.get_args()}")
 
-    args_to_keep = cfg.get_args()
-    for arg in args_to_keep:
-        df[arg.name] = df["args"].apply(
-            lambda row: (
-                row.get(arg.raw_name, arg.default_value)
-                if isinstance(row, dict)
-                else arg.default_value
+    if "args" in set(df.columns):
+        args_to_keep = cfg.get_args()
+        for arg in args_to_keep:
+            df[arg.name] = df["args"].apply(
+                lambda row: (
+                    row.get(arg.raw_name, arg.default_value)
+                    if isinstance(row, dict)
+                    else arg.default_value
+                )
             )
-        )
-    df.drop(["args"], axis=1, inplace=True)
+        df.drop(["args"], axis=1, inplace=True)
 
     # create a local symbol table
     local_symbol_table = TraceSymbolTable()
@@ -415,14 +501,74 @@ def add_iteration(df: pd.DataFrame, symbol_table: TraceSymbolTable) -> pd.DataFr
     return profiler_steps
 
 
+# @profile
+def parse_trace_dataframe_json(
+    trace_file_path: str, cfg: ParserConfig
+) -> Tuple[MetaData, pd.DataFrame, TraceSymbolTable]:
+    trace_record = parse_trace_dict(trace_file_path)
+    meta: Dict[str, Any] = {k: v for k, v in trace_record.items() if k != "traceEvents"}
+    df: pd.DataFrame = pd.DataFrame()
+    local_symbol_table: TraceSymbolTable = TraceSymbolTable()
+    if "traceEvents" in trace_record:
+        df = pd.DataFrame(trace_record["traceEvents"])
+
+        # assign an index to each event
+        df.reset_index(inplace=True)
+        df["index"] = pd.to_numeric(df["index"], downcast="integer")
+
+        df, local_symbol_table = compress_df(df, cfg)
+
+    return meta, df, local_symbol_table
+
+
+# @profile
+def parse_trace_dataframe_ijson(
+    trace_file_path: str, cfg: ParserConfig
+) -> Tuple[MetaData, pd.DataFrame, TraceSymbolTable]:
+    # TODO print backend
+    meta: Dict[str, Any] = {}
+    # k: v for k, v in trace_record.items() if k != "traceEvents"}
+
+    df = parse_trace_events_ijson(trace_file_path)
+
+    # assign an index to each event
+    df.reset_index(inplace=True)
+    df["index"] = pd.to_numeric(df["index"], downcast="integer")
+
+    df, local_symbol_table = compress_df(df, cfg)
+    return meta, df, local_symbol_table
+
+
+# @profile
+def parse_trace_dataframe_ijson_batched(
+    trace_file_path: str, cfg: ParserConfig, compress_on_fly: bool = False
+) -> Tuple[MetaData, pd.DataFrame, TraceSymbolTable]:
+    # TODO print backend
+    meta: Dict[str, Any] = {}
+    # k: v for k, v in trace_record.items() if k != "traceEvents"}
+
+    df = parse_trace_events_ijson_batched(trace_file_path, cfg, compress_on_fly)
+
+    # assign an index to each event
+    df.reset_index(inplace=True)
+    df["index"] = pd.to_numeric(df["index"], downcast="integer")
+
+    df, local_symbol_table = compress_df(df, cfg)
+    return meta, df, local_symbol_table
+
+
 def parse_trace_dataframe(
-    trace_file_path: str, cfg: Optional[ParserConfig] = None
+    trace_file_path: str,
+    cfg: Optional[ParserConfig] = None,
+    parser_backend: str = "ijson",
+    trace_memory=False,
 ) -> Tuple[MetaData, pd.DataFrame, TraceSymbolTable]:
     """parse a single trace file into a meat test_data dictionary and a dataframe of events.
     Args:
         trace_file_path (str): The path to a trace file. When the trace_file is a relative path.
             This method combines the object's trace_path with trace_file to get the full path of the trace file.
         cfg (ParserConfig, Optional): A ParserConfig object controls how to parse the trace file.
+        TODO parser_backend
     Returns:
         Tuple[MetaData, pd.DataFrame, TraceSymbolTable]
             The first item is the trace's metadata;
@@ -435,30 +581,55 @@ def parse_trace_dataframe(
         JSONDecodeError when the trace file is not a valid JSON document.
         ValueError when the trace_file doesn't end with ".gz" or "json".
     """
+    if not (trace_file_path.endswith(".gz") or trace_file_path.endswith(".json")):
+        raise ValueError(
+            f"expect the value of trace_file ({trace_file_path}) ends with '.gz' or 'json'"
+        )
+
     t_start = time.perf_counter()
-    trace_record = parse_trace_dict(trace_file_path)
+    cfg = cfg or ParserConfig.get_default_cfg()
 
-    meta: Dict[str, Any] = {k: v for k, v in trace_record.items() if k != "traceEvents"}
-    df: pd.DataFrame = pd.DataFrame()
-    local_symbol_table: TraceSymbolTable = TraceSymbolTable()
-    if "traceEvents" in trace_record:
-        df = pd.DataFrame(trace_record["traceEvents"])
+    if trace_memory:
+        tracemalloc.start()
+    t_start1 = time.perf_counter()
 
-        # assign an index to each event
-        df.reset_index(inplace=True)
-        df["index"] = pd.to_numeric(df["index"], downcast="integer")
+    if parser_backend == "json":
+        meta, df, local_symbol_table = parse_trace_dataframe_json(trace_file_path, cfg)
+    elif parser_backend == "ijson":
+        meta, df, local_symbol_table = parse_trace_dataframe_ijson(trace_file_path, cfg)
+    elif parser_backend == "ijson_batched":
+        meta, df, local_symbol_table = parse_trace_dataframe_ijson_batched(
+            trace_file_path, cfg
+        )
+    elif parser_backend == "ijson_batched_ofc":
+        meta, df, local_symbol_table = parse_trace_dataframe_ijson_batched(
+            trace_file_path, cfg, compress_on_fly=True
+        )
+    else:
+        raise ValueError(f"unexpected or unsupported parser = {parser_backend}")
 
-        # add fwd bwd links between CPU ops
-        add_fwd_bwd_links(df)
+    t_end1 = time.perf_counter()
+    logger.warning(
+        f"Parsed {trace_file_path} backend={parser_backend} in {(t_end1 - t_start1):.2f} seconds; current PID:{os. getpid()}"
+    )
+    if trace_memory:
+        current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        logger.warning(
+            f"Parser Memory usage peak = {(peak/1024/1024):.2f} MB, current = {(current/1024/1024):.2f} MB"
+        )
 
-        df, local_symbol_table = compress_df(df, cfg)
-        transform_correlation_to_index(df)
-        add_iteration(df, local_symbol_table)
-        df["end"] = df["ts"] + df["dur"]
+    # add fwd bwd links between CPU ops
+    add_fwd_bwd_links(df)
+
+    transform_correlation_to_index(df)
+
+    add_iteration(df, local_symbol_table)
+    df["end"] = df["ts"] + df["dur"]
 
     t_end = time.perf_counter()
-    logger.debug(
-        f"Parsed {trace_file_path} in {(t_end - t_start):.2f} seconds; current PID:{os. getpid()}"
+    logger.warning(
+        f"Overall parsing of {trace_file_path} in {(t_end - t_start):.2f} seconds; current PID:{os. getpid()}"
     )
     return meta, df, local_symbol_table
 
@@ -708,7 +879,7 @@ class Trace:
                 )
 
         t1 = time.perf_counter()
-        logger.debug(
+        logger.warning(
             f"leaving {sys._getframe().f_code.co_name} duration={t1 - t0:.2f} seconds"
         )
 
@@ -742,7 +913,7 @@ class Trace:
             logger.error("The list of ranks to be parsed is empty.")
             self.is_parsed = False
         t1 = time.perf_counter()
-        logger.debug(
+        logger.warning(
             f"leaving {sys._getframe().f_code.co_name} duration={t1 - t0:.2f} seconds"
         )
 

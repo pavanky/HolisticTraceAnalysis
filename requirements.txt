@@ -1,4 +1,5 @@
 # Python dependencies required for users
+ijon
 jupyterlab>=3.5.1
 numpy>=1.23.5
 networkx>=3.1
