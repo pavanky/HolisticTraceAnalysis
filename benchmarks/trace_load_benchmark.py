@@ -15,12 +15,14 @@ _TRACE_DIRS = ["vision_transformer", "inference_single_rank"]
 TRACE_DIRS = [f"tests/data/{d}" for d in _TRACE_DIRS]
 TRACE_DIRS = [
     "tests/data/vision_transformer",
-    "../../load_benchmarks/python_func_ops_example",
+    "tests/data/inference_single_rank",
+    #"../../load_benchmarks/python_func_ops_example",
 ]
 
 TRACE_FILES = [
     "tests/data/vision_transformer/rank-1.json.gz",
-    "../../load_benchmarks/python_func_ops_example/rank-1.Jan_17_19_32_44.5411.pt.trace.json.gz",
+    "tests/data/vision_transformer/inference_rank_0.json.gz",
+    # "../../load_benchmarks/python_func_ops_example/rank-1.Jan_17_19_32_44.5411.pt.trace.json.gz",
 ]
 
 # For large number of iterations this makes the logs more readable,

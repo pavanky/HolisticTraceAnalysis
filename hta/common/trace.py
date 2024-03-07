@@ -32,6 +32,17 @@ PHASE_COUNTER: str = "C"
 PHASE_FLOW_START: str = "s"
 PHASE_FLOW_END: str = "f"
 
+TRACE_PARSING_BACKEND: str = "ijson_batched_ofc"
+
+
+def set_trace_parsing_backend(backend: str):
+    global TRACE_PARSING_BACKEND
+    TRACE_PARSING_BACKEND = backend
+
+
+def get_trace_parsing_backend() -> str:
+    return TRACE_PARSING_BACKEND
+
 
 class _SymbolCollector:
     """
@@ -202,7 +213,7 @@ def parse_trace_events_ijson(trace_file_path: str) -> pd.DataFrame:
     with (
         gzip.open(trace_file_path, "rb")
         if trace_file_path.endswith(".gz")
-        else open(trace_file_path, "r")
+        else open(trace_file_path, "rb")
     ) as fh:
 
         iterator = ijson.items(fh, "traceEvents.item", use_float=True)
@@ -232,6 +243,8 @@ def parse_trace_events_ijson_batched(
         for arg, val in e["args"].items():
             if arg in args_to_keep:
                 e[arg_name_map[arg]] = val
+            elif e.get("cat", "") == "cuda_profiler_range":
+                e[arg] = val
         e.pop("args", None)
         return e
 
@@ -241,7 +254,7 @@ def parse_trace_events_ijson_batched(
     with (
         gzip.open(trace_file_path, "rb")
         if trace_file_path.endswith(".gz")
-        else open(trace_file_path, "r")
+        else open(trace_file_path, "rb")
     ) as fh:
 
         iterator = (
@@ -268,6 +281,16 @@ def parse_trace_events_ijson_batched(
             dfs.append(pd.DataFrame(batch))
 
         df = pd.concat(dfs, ignore_index=True)
+
+        # Fill args if not populated
+        arg_default_map = {arg.name: arg.default_value for arg in cfg.get_args()}
+        trace_args_cols = set(arg_default_map.keys()).intersection(set(df.columns))
+        for arg_col in trace_args_cols:
+            df[arg_col].fillna(arg_default_map[arg_col], inplace=True)
+
+        missing_cols = set(arg_default_map.keys()).difference(set(df.columns))
+        for arg_col in missing_cols:
+            df[arg_col] = arg_default_map[arg_col]
 
     t_end = time.perf_counter()
     logger.warning(
@@ -300,9 +323,10 @@ def compress_df(
     # drop columns
     columns_to_drop = {"ph", "id", "bp", "s"}.intersection(set(df.columns))
     df.drop(list(columns_to_drop), axis=1, inplace=True)
+    columns = set(df.columns)
 
     # performance counters appear as args
-    if "cuda_profiler_range" in df.cat.unique():
+    if "args" in columns and "cuda_profiler_range" in df.cat.unique():
         counter_names = set.union(
             *[set(d.keys()) for d in df[df.cat == "cuda_profiler_range"]["args"].values]
         )
@@ -313,7 +337,7 @@ def compress_df(
         logger.info(f"counter_names={counter_names}")
         logger.info(f"args={cfg.get_args()}")
 
-    if "args" in set(df.columns):
+    if "args" in columns:
         args_to_keep = cfg.get_args()
         for arg in args_to_keep:
             df[arg.name] = df["args"].apply(
@@ -560,7 +584,7 @@ def parse_trace_dataframe_ijson_batched(
 def parse_trace_dataframe(
     trace_file_path: str,
     cfg: Optional[ParserConfig] = None,
-    parser_backend: str = "ijson",
+    parser_backend: str = get_trace_parsing_backend(),
     trace_memory=False,
 ) -> Tuple[MetaData, pd.DataFrame, TraceSymbolTable]:
     """parse a single trace file into a meat test_data dictionary and a dataframe of events.
