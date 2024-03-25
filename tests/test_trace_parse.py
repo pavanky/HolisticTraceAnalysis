@@ -7,7 +7,8 @@ import unittest
 
 import pandas as pd
 
-from hta.common.trace import get_trace_parsing_backend, parse_trace_dict, Trace
+from hta.common.trace import parse_trace_dict, Trace
+from hta.common.trace_parser import get_default_trace_parsing_backend
 
 
 class TraceParseTestCase(unittest.TestCase):
@@ -48,7 +49,7 @@ class TraceParseTestCase(unittest.TestCase):
         df.dropna(axis=0, subset=["dur", "cat"], inplace=True)
 
         to_drop_cats = ["Trace"]
-        if get_trace_parsing_backend() != "json":
+        if get_default_trace_parsing_backend() != "json":
             to_drop_cats.append("python_function")
         df.drop(df[df["cat"].isin(to_drop_cats)].index, inplace=True)
         return df

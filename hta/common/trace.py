@@ -8,362 +8,29 @@ import gzip
 import json
 import multiprocessing as mp
 import os
-import queue
 import re
 import sys
 import time
 import tracemalloc
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-
-import ijson
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from hta.common.trace_file import get_trace_files
+from hta.common.trace_parser import parse_trace_dataframe, parse_trace_dict
+from hta.common.trace_symbol_table import (
+    decode_symbol_id_to_symbol_name,
+    TraceSymbolTable,
+)
 from hta.configs.config import logger
 from hta.configs.default_values import DEFAULT_TRACE_DIR
-from hta.configs.parser_config import AttributeSpec, ParserConfig, ValueType
-from hta.utils.utils import get_mp_pool_size, normalize_path, shorten_name
-
-# from memory_profiler import profile
+from hta.configs.parser_config import ParserConfig
+from hta.utils.utils import get_mp_pool_size, normalize_path
 
 MetaData = Dict[str, Any]
 PHASE_COUNTER: str = "C"
 PHASE_FLOW_START: str = "s"
 PHASE_FLOW_END: str = "f"
-
-TRACE_PARSING_BACKEND: str = "ijson_batched_ofc"
-
-
-def set_trace_parsing_backend(backend: str):
-    global TRACE_PARSING_BACKEND
-    TRACE_PARSING_BACKEND = backend
-
-
-def get_trace_parsing_backend() -> str:
-    return TRACE_PARSING_BACKEND
-
-
-class _SymbolCollector:
-    """
-    To support a multiprocessing version of symbol table update, we use _SymbolCollector to a shared queue
-    to collect all the symbols and then use a single process to merge the results. A _SymbolCollector object
-    implements a function object so that it allow the multiple processes to share the data.
-    """
-
-    def __init__(self, q: queue.Queue[Any]):
-        self.queue = q
-
-    def __call__(self, symbols: Iterable[str]) -> None:
-        for s in symbols:
-            self.queue.put(s)
-
-
-# We use a TraceSymbolTable to store the bidirectional symbol<-->id mapping for each Trace object.
-# This table will be shared among all the ranks to encode/decode the symbols in their data frames.
-class TraceSymbolTable:
-    """
-    TraceSymbolTable stores the bidirectional symbol<-->id mapping for all traces.
-    Because of potential races caused by multiprocessing, we serialize updates to the
-    TraceSymbolTable using a synchronize.lock.
-
-    We assume all read operations to this table by a Trace object occur after it adds all its symbols.
-    Therefore, there is no need to lock the read access.
-
-    Attributes:
-        sym_table (List[str]) : a list of symbols.
-        sym_index (Dict[str, int]) : a map from symbol to ID.
-    """
-
-    def __init__(self):
-        self.sym_table: List[str] = []
-        self.sym_index: Dict[str, int] = {}
-
-    def add_symbols(self, symbols: Iterable[str]) -> None:
-        for s in symbols:
-            if s not in self.sym_index:
-                idx = len(self.sym_table)
-                self.sym_table.append(s)
-                self.sym_index[s] = idx
-
-    def add_symbols_mp(self, symbols_list: List[Iterable[str]]) -> None:
-        m = mp.Manager()
-        shared_queue: queue.Queue[Any] = m.Queue()
-        collector = _SymbolCollector(shared_queue)
-
-        with mp.get_context("spawn").Pool(
-            min(mp.cpu_count(), len(symbols_list))
-        ) as pool:
-            pool.map(collector, symbols_list)
-            pool.close()
-            pool.join()
-
-        all_symbols = []
-        while not shared_queue.empty():
-            all_symbols.append(shared_queue.get())
-        self.add_symbols(all_symbols)
-
-    def get_sym_id_map(self) -> Dict[str, int]:
-        return self.sym_index
-
-    def get_sym_table(self) -> List[str]:
-        return self.sym_table
-
-    def add_symbols_to_trace_df(self, trace_df: pd.DataFrame, col: str) -> None:
-        """
-        Take a trace dataframe and expand symbols in one of its columns.
-        Args:
-            trace_df (pd.DataFrame): Dataframe for trace from one rank.
-            col (str): column to expand symbols on.
-
-        Returns:
-            None
-        """
-        trace_df[col] = trace_df[col].apply(
-            lambda i: self.sym_table[i] if (0 <= i < len(self.sym_table)) else ""
-        )
-
-    @staticmethod
-    def create_symbol_table_from_df(df: pd.DataFrame) -> TraceSymbolTable:
-        """Create a symbol table from a DataFrame's cat and name columns.
-
-        Args:
-            df (pd.DataFrame): an input DataFrame.
-
-        Returns:
-            TraceSymbolTable: a symbol table containing all unique `name` and `cat` symbols in df.
-
-        Raise:
-            ValueError: when one of the follow two conditions happens:
-                (1) `df` doesn't have the `name` and `cat` columns; or
-                (2) they are not string type.
-        """
-        if (
-            ("name" in df.columns)
-            and (df.dtypes["name"] == "object")
-            and ("cat" in df.columns)
-            and (df.dtypes["cat"] == "object")
-        ):
-            symbols = set(df["cat"].unique()).union(set(df["name"].unique()))
-            symbol_table = TraceSymbolTable()
-            symbol_table.add_symbols(symbols)
-            return symbol_table
-        raise ValueError(
-            "Expect both name and cat columns of string types to be present in the dataframe"
-        )
-
-    def is_cuda_runtime(self, trace_df: pd.DataFrame, idx: int) -> bool:
-        """Check if an event is a CUDA runtime event"""
-        return trace_df["cat"].loc[idx] == self.sym_index["cuda_runtime"] or (
-            "cuda_driver" in self.sym_index.keys()
-            and (trace_df["cat"].loc[idx] == self.sym_index["cuda_driver"])
-        )
-
-    def is_operator(self, trace_df: pd.DataFrame, idx: int) -> bool:
-        """Check if an event is a CPU operator"""
-        return trace_df["cat"].loc[idx] == self.sym_index["cpu_op"]
-
-    def get_runtime_launch_events_query(self) -> str:
-        """Returns a SQL query you can pass to trace dataframe query()
-        to filter events that are CUDA runtime kernel and memcpy launches."""
-        cudaLaunchKernel_id = self.sym_index.get("cudaLaunchKernel", -128)
-        cudaLaunchKernelExC_id = self.sym_index.get("cudaLaunchKernelExC", -128)
-        cuLaunchKernel_id = self.sym_index.get("cuLaunchKernel", -128)
-        cudaMemcpyAsync_id = self.sym_index.get("cudaMemcpyAsync", -128)
-        cudaMemsetAsync_id = self.sym_index.get("cudaMemsetAsync", -128)
-
-        return (
-            f"((name == {cudaMemsetAsync_id}) or (name == {cudaMemcpyAsync_id}) or "
-            f" (name == {cudaLaunchKernel_id}) or (name == {cudaLaunchKernelExC_id})"
-            f" or (name == {cuLaunchKernel_id})) and (index_correlation > 0)"
-        )
-
-
-# @profile
-def parse_trace_dict(trace_file_path: str) -> Dict[str, Any]:
-    """
-    Parse a raw trace file into a dictionary.
-
-    Args:
-        trace_file_path (str) : the path to a trace file.
-
-    Returns:
-        A dictionary representation of the trace.
-    """
-    t_start = time.perf_counter()
-    trace_record: Dict[str, Any] = {}
-    if trace_file_path.endswith(".gz"):
-        with gzip.open(trace_file_path, "rb") as fh:
-            trace_record = json.loads(fh.read())
-    elif trace_file_path.endswith(".json"):
-        with open(trace_file_path, "r") as fh2:
-            trace_record = json.loads(fh2.read())
-    else:
-        raise ValueError(
-            f"expect the value of trace_file ({trace_file_path}) ends with '.gz' or 'json'"
-        )
-    t_end = time.perf_counter()
-    logger.warning(f"Parsed {trace_file_path} time = {(t_end - t_start):.2f} seconds ")
-    return trace_record
-
-
-# @profile
-def parse_trace_events_ijson(trace_file_path: str) -> pd.DataFrame:
-    t_start = time.perf_counter()
-    with (
-        gzip.open(trace_file_path, "rb")
-        if trace_file_path.endswith(".gz")
-        else open(trace_file_path, "rb")
-    ) as fh:
-
-        iterator = ijson.items(fh, "traceEvents.item", use_float=True)
-
-        # this version ignore python function tracer
-        df = pd.DataFrame(e for e in iterator if e.get("cat") != "python_function")
-        # df = pd.DataFrame(iterator)
-
-    t_end = time.perf_counter()
-    logger.warning(
-        f"Parsed (ijson) {trace_file_path} time = {(t_end - t_start):.2f} seconds "
-    )
-    return df
-
-
-def parse_trace_events_ijson_batched(
-    trace_file_path: str, cfg: ParserConfig, compress_on_fly: bool = False
-) -> pd.DataFrame:
-
-    arg_name_map = {arg.raw_name: arg.name for arg in cfg.get_args()}
-    args_to_keep = arg_name_map.keys()
-    # logger.warning(f"arg_name_map = {arg_name_map}")
-
-    def trim_event(e):
-        if "args" not in e:
-            return e
-        for arg, val in e["args"].items():
-            if arg in args_to_keep:
-                e[arg_name_map[arg]] = val
-            elif e.get("cat", "") == "cuda_profiler_range":
-                e[arg] = val
-        e.pop("args", None)
-        return e
-
-    df = pd.DataFrame()
-
-    t_start = time.perf_counter()
-    with (
-        gzip.open(trace_file_path, "rb")
-        if trace_file_path.endswith(".gz")
-        else open(trace_file_path, "rb")
-    ) as fh:
-
-        iterator = (
-            e
-            for e in ijson.items(fh, "traceEvents.item", use_float=True)
-            if e.get("cat") != "python_function"
-        )
-        if compress_on_fly:
-            iterator = (trim_event(e) for e in iterator)
-
-        batch_size = 1000
-        batch = []
-        dfs = []
-
-        # Iterate over filtered dictionaries and append to DataFrame in batches
-        for item in iterator:
-            batch.append(item)
-            if len(batch) == batch_size:
-                dfs.append(pd.DataFrame(batch))
-                batch = []
-
-        # Append remaining items if any
-        if batch:
-            dfs.append(pd.DataFrame(batch))
-
-        df = pd.concat(dfs, ignore_index=True)
-
-        # Fill args if not populated
-        arg_default_map = {arg.name: arg.default_value for arg in cfg.get_args()}
-        trace_args_cols = set(arg_default_map.keys()).intersection(set(df.columns))
-        for arg_col in trace_args_cols:
-            df[arg_col].fillna(arg_default_map[arg_col], inplace=True)
-
-        missing_cols = set(arg_default_map.keys()).difference(set(df.columns))
-        for arg_col in missing_cols:
-            df[arg_col] = arg_default_map[arg_col]
-
-    t_end = time.perf_counter()
-    logger.warning(
-        f"Parsed (ijson) {trace_file_path} time = {(t_end - t_start):.2f} seconds "
-    )
-    return df
-
-
-def compress_df(
-    df: pd.DataFrame, cfg: Optional[ParserConfig] = None
-) -> Tuple[pd.DataFrame, TraceSymbolTable]:
-    """
-    Compress a Dataframe to reduce its memory footprint.
-
-    Args:
-        df (pd.DataFrame): the input DataFrame
-        cfg (Optional[ParserConfig]): an object to customize how to parse/compress the trace.
-
-    Returns:
-        Tuple[pd.DataFrame, TraceSymbolTable]
-            The first item is the compressed dataframe.
-            The second item is the local symbol table specific to this dataframe.
-    """
-    cfg = cfg or ParserConfig.get_default_cfg()
-
-    # drop rows with null values
-    df.dropna(axis=0, subset=["dur", "cat"], inplace=True)
-    df.drop(df[df["cat"] == "Trace"].index, inplace=True)
-
-    # drop columns
-    columns_to_drop = {"ph", "id", "bp", "s"}.intersection(set(df.columns))
-    df.drop(list(columns_to_drop), axis=1, inplace=True)
-    columns = set(df.columns)
-
-    # performance counters appear as args
-    if "args" in columns and "cuda_profiler_range" in df.cat.unique():
-        counter_names = set.union(
-            *[set(d.keys()) for d in df[df.cat == "cuda_profiler_range"]["args"].values]
-        )
-        # args_to_keep = args_to_keep.union(counter_names)
-        cfg.add_args(
-            [AttributeSpec(name, name, ValueType.Int, -1) for name in counter_names]
-        )
-        logger.info(f"counter_names={counter_names}")
-        logger.info(f"args={cfg.get_args()}")
-
-    if "args" in columns:
-        args_to_keep = cfg.get_args()
-        for arg in args_to_keep:
-            df[arg.name] = df["args"].apply(
-                lambda row: (
-                    row.get(arg.raw_name, arg.default_value)
-                    if isinstance(row, dict)
-                    else arg.default_value
-                )
-            )
-        df.drop(["args"], axis=1, inplace=True)
-
-    # create a local symbol table
-    local_symbol_table = TraceSymbolTable()
-    symbols = set(df["cat"].unique()).union(set(df["name"].unique()))
-    local_symbol_table.add_symbols(symbols)
-
-    sym_index = local_symbol_table.get_sym_id_map()
-    for col in ["cat", "name"]:
-        df[col] = df[col].apply(lambda s: sym_index[s])
-
-    # data type downcast
-    for col in df.columns:
-        if df[col].dtype.kind == "i":
-            df[col] = pd.to_numeric(df[col], errors="coerce", downcast="integer")
-
-    return df, local_symbol_table
 
 
 def transform_correlation_to_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -525,85 +192,26 @@ def add_iteration(df: pd.DataFrame, symbol_table: TraceSymbolTable) -> pd.DataFr
     return profiler_steps
 
 
-# @profile
-def parse_trace_dataframe_json(
-    trace_file_path: str, cfg: ParserConfig
-) -> Tuple[MetaData, pd.DataFrame, TraceSymbolTable]:
-    trace_record = parse_trace_dict(trace_file_path)
-    meta: Dict[str, Any] = {k: v for k, v in trace_record.items() if k != "traceEvents"}
-    df: pd.DataFrame = pd.DataFrame()
-    local_symbol_table: TraceSymbolTable = TraceSymbolTable()
-    if "traceEvents" in trace_record:
-        df = pd.DataFrame(trace_record["traceEvents"])
-
-        # assign an index to each event
-        df.reset_index(inplace=True)
-        df["index"] = pd.to_numeric(df["index"], downcast="integer")
-
-        df, local_symbol_table = compress_df(df, cfg)
-
-    return meta, df, local_symbol_table
-
-
-# @profile
-def parse_trace_dataframe_ijson(
-    trace_file_path: str, cfg: ParserConfig
-) -> Tuple[MetaData, pd.DataFrame, TraceSymbolTable]:
-    # TODO print backend
-    meta: Dict[str, Any] = {}
-    # k: v for k, v in trace_record.items() if k != "traceEvents"}
-
-    df = parse_trace_events_ijson(trace_file_path)
-
-    # assign an index to each event
-    df.reset_index(inplace=True)
-    df["index"] = pd.to_numeric(df["index"], downcast="integer")
-
-    df, local_symbol_table = compress_df(df, cfg)
-    return meta, df, local_symbol_table
-
-
-# @profile
-def parse_trace_dataframe_ijson_batched(
-    trace_file_path: str, cfg: ParserConfig, compress_on_fly: bool = False
-) -> Tuple[MetaData, pd.DataFrame, TraceSymbolTable]:
-    # TODO print backend
-    meta: Dict[str, Any] = {}
-    # k: v for k, v in trace_record.items() if k != "traceEvents"}
-
-    df = parse_trace_events_ijson_batched(trace_file_path, cfg, compress_on_fly)
-
-    # assign an index to each event
-    df.reset_index(inplace=True)
-    df["index"] = pd.to_numeric(df["index"], downcast="integer")
-
-    df, local_symbol_table = compress_df(df, cfg)
-    return meta, df, local_symbol_table
-
-
-def parse_trace_dataframe(
+def parse_trace_file(
     trace_file_path: str,
     cfg: Optional[ParserConfig] = None,
-    parser_backend: str = get_trace_parsing_backend(),
-    trace_memory=False,
 ) -> Tuple[MetaData, pd.DataFrame, TraceSymbolTable]:
     """parse a single trace file into a meat test_data dictionary and a dataframe of events.
     Args:
         trace_file_path (str): The path to a trace file. When the trace_file is a relative path.
             This method combines the object's trace_path with trace_file to get the full path of the trace file.
         cfg (ParserConfig, Optional): A ParserConfig object controls how to parse the trace file.
-        TODO parser_backend
     Returns:
         Tuple[MetaData, pd.DataFrame, TraceSymbolTable]
             The first item is the trace's metadata;
             The second item is the dataframe representation of the trace's events.
             The third item is the symbol table to encode the symbols of the trace.
 
-
     Raises:
         OSError when the trace file doesn't exist or current process has no permission to access it.
         JSONDecodeError when the trace file is not a valid JSON document.
         ValueError when the trace_file doesn't end with ".gz" or "json".
+        ValueError if parser config passes invalid parser backend.
     """
     if not (trace_file_path.endswith(".gz") or trace_file_path.endswith(".json")):
         raise ValueError(
@@ -613,35 +221,7 @@ def parse_trace_dataframe(
     t_start = time.perf_counter()
     cfg = cfg or ParserConfig.get_default_cfg()
 
-    if trace_memory:
-        tracemalloc.start()
-    t_start1 = time.perf_counter()
-
-    if parser_backend == "json":
-        meta, df, local_symbol_table = parse_trace_dataframe_json(trace_file_path, cfg)
-    elif parser_backend == "ijson":
-        meta, df, local_symbol_table = parse_trace_dataframe_ijson(trace_file_path, cfg)
-    elif parser_backend == "ijson_batched":
-        meta, df, local_symbol_table = parse_trace_dataframe_ijson_batched(
-            trace_file_path, cfg
-        )
-    elif parser_backend == "ijson_batched_ofc":
-        meta, df, local_symbol_table = parse_trace_dataframe_ijson_batched(
-            trace_file_path, cfg, compress_on_fly=True
-        )
-    else:
-        raise ValueError(f"unexpected or unsupported parser = {parser_backend}")
-
-    t_end1 = time.perf_counter()
-    logger.warning(
-        f"Parsed {trace_file_path} backend={parser_backend} in {(t_end1 - t_start1):.2f} seconds; current PID:{os. getpid()}"
-    )
-    if trace_memory:
-        current, peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
-        logger.warning(
-            f"Parser Memory usage peak = {(peak/1024/1024):.2f} MB, current = {(current/1024/1024):.2f} MB"
-        )
+    meta, df, local_symbol_table = parse_trace_dataframe(trace_file_path, cfg)
 
     # add fwd bwd links between CPU ops
     add_fwd_bwd_links(df)
@@ -735,19 +315,6 @@ def add_fwd_bwd_links(df: pd.DataFrame) -> None:
     df["fwdbwd"] = df.apply(_set_fwd_or_bwd, axis=1)
 
 
-def decode_symbol_id_to_symbol_name(
-    df: pd.DataFrame, symbol_table: TraceSymbolTable, use_shorten_name: bool
-) -> None:
-    """Decode symbol ids into symbol names and write the decoded data into s_name and s_cat columns."""
-    s_tab: List[str] = symbol_table.sym_table
-    if use_shorten_name:
-        s_tab = [shorten_name(s) for s in s_tab]
-    if "name" in df.columns and df["name"].dtype.kind == "i":
-        df["s_name"] = df["name"].apply(lambda idx: s_tab[idx])
-    if "cat" in df.columns and df["cat"].dtype.kind == "i":
-        df["s_cat"] = df["cat"].apply(lambda idx: s_tab[idx])
-
-
 class Trace:
     """
     A container for the traces collected for a distributed ML training job.
@@ -827,7 +394,7 @@ class Trace:
                 self.meta_data[rank],
                 self.traces[rank],
                 local_symbol_table,
-            ) = parse_trace_dataframe(trace_filepath)
+            ) = parse_trace_file(trace_filepath)
             # update the global symbol table
             self.symbol_table.add_symbols(local_symbol_table.get_sym_table())
             # fix the encoding of the data frame
@@ -858,7 +425,7 @@ class Trace:
         if not use_multiprocessing:
             for rank in ranks:
                 logger.debug(f"parsing trace for rank-{rank}")
-                result = parse_trace_dataframe(self.trace_files[rank])
+                result = parse_trace_file(self.trace_files[rank])
                 self.meta_data[rank], self.traces[rank], local_symbol_tables[rank] = (
                     result[0],
                     result[1],
@@ -872,14 +439,14 @@ class Trace:
                 num_procs = min(len(ranks), mp.cpu_count())
             else:
                 tracemalloc.start()
-                parse_trace_dataframe(trace_paths[0])
+                parse_trace_file(trace_paths[0])
                 current, peak = tracemalloc.get_traced_memory()
                 tracemalloc.stop()
                 num_procs = get_mp_pool_size(peak, len(ranks))
             logger.debug(f"using {num_procs} processes for parsing.")
 
             with mp.get_context("fork").Pool(num_procs) as pool:
-                results = pool.map(parse_trace_dataframe, trace_paths)
+                results = pool.map(parse_trace_file, trace_paths)
                 pool.close()
                 pool.join()
             logger.debug(f"finished parallel parsing using {num_procs} processes.")
