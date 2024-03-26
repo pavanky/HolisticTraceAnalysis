@@ -15,21 +15,69 @@ import pandas as pd
 from hta.common.trace_symbol_table import TraceSymbolTable
 
 from hta.configs.config import logger
-from hta.configs.parser_config import AttributeSpec, ParserConfig, ValueType
+from hta.configs.parser_config import (
+    AttributeSpec,
+    ParserConfig,
+    SUPPORTED_PARSER_BACKENDS,
+    ValueType,
+)
 
 # from memory_profiler import profile
 
 MetaData = Dict[str, Any]
-_TRACE_PARSING_BACKEND: str = "json"
-# _TRACE_PARSING_BACKEND: str = "ijson_batch_and_compress"
+_TRACE_PARSING_BACKEND: str = ""
+
+IJSON_INSTRS = """ Install ijson with pip by using
+  pip install ijson
+
+Also please install yajl for optimal speed. You will need an installation of yajl (C++ library) for your system, followed by the python bindings.
+  conda install anaconda::yajl  # or system install of yajl without conda
+  pip install yajl-py==2.1.2
+
+Check the backend with: python3 -c "import ijson; print(ijson.backend)" output = yajl2_c
+For more details see https://pypi.org/project/ijson/#performance-tips, https://anaconda.org/anaconda/yajl, https://pypi.org/project/yajl/"""
 
 
-def set_default_trace_parsing_backend(backend: str):
+def _auto_detect_parser_backend() -> str:
+    """Finds optimal parser backend and returns it"""
+    try:
+        import ijson
+    except ModuleNotFoundError:
+        logger.warning("Trace parsing can be sped up by using ijson." + IJSON_INSTRS)
+        return "json"
+
+    if "yajl" not in ijson.backend:
+        logger.warning(
+            f"Current ijson backend {ijson.backend} does not use 'yajl'."
+            "The ijson parser will be much slower as it uses python"
+            "Reverting to simple json parser!\n"
+            "Consider instructions-" + IJSON_INSTRS
+        )
+        return "json"
+
+    # Use the best ijson backend
+    return "ijson_batch_and_compress"
+
+
+def set_default_trace_parsing_backend(parser_backend: str):
+    """Set the default trace parser backend"""
     global _TRACE_PARSING_BACKEND
-    _TRACE_PARSING_BACKEND = backend
+    if parser_backend not in SUPPORTED_PARSER_BACKENDS:
+        raise ValueError(
+            f"Unsupported parser backend = {parser_backend},"
+            f" must be one of {SUPPORTED_PARSER_BACKENDS}"
+        )
+    _TRACE_PARSING_BACKEND = parser_backend
 
 
 def get_default_trace_parsing_backend() -> str:
+    """Get the default trace parser backend"""
+    global _TRACE_PARSING_BACKEND
+    if _TRACE_PARSING_BACKEND == "":
+        # TODO: This will be updated in a future release
+        _TRACE_PARSING_BACKEND = _auto_detect_parser_backend()
+        # _TRACE_PARSING_BACKEND = "json"
+        assert _TRACE_PARSING_BACKEND in SUPPORTED_PARSER_BACKENDS
     return _TRACE_PARSING_BACKEND
 
 

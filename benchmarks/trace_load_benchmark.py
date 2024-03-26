@@ -8,10 +8,10 @@ import logging
 import pyperf
 
 from hta.common.trace import parse_trace_file, Trace
-from hta.configs.parser_config import SUPPORTED_PARSER_BACKENDS
 from hta.common.trace_parser import set_default_trace_parsing_backend
 
 from hta.configs.config import logger
+from hta.configs.parser_config import SUPPORTED_PARSER_BACKENDS
 
 _TRACE_DIRS = ["vision_transformer", "inference_single_rank"]
 TRACE_DIRS = [f"tests/data/{d}" for d in _TRACE_DIRS]
@@ -60,9 +60,9 @@ def load_and_parse_trace_file(loops: int, filename: str, backend: str):
 runner = pyperf.Runner()
 
 for trace_dir in TRACE_DIRS:
-   runner.bench_time_func(
-       f"parse[{trace_dir}]", load_and_parse_trace, trace_dir, inner_loops=1
-   )
+    runner.bench_time_func(
+        f"parse[{trace_dir}]", load_and_parse_trace, trace_dir, inner_loops=1
+    )
 
 # Run different parser backends to identify performance and memory overhead
 for trace_file in TRACE_FILES:

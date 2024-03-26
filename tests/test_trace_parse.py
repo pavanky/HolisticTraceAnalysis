@@ -5,10 +5,13 @@
 import os
 import unittest
 
+# import unittest.mock as mock
+
 import pandas as pd
 
 from hta.common.trace import parse_trace_dict, Trace
 from hta.common.trace_parser import (
+    _auto_detect_parser_backend,
     get_default_trace_parsing_backend,
     set_default_trace_parsing_backend,
 )
@@ -125,12 +128,10 @@ class TraceParseTestCase(unittest.TestCase):
             )
 
 
+@unittest.skipIf(
+    _auto_detect_parser_backend() == "json", "Skipping ijson based trace load tests"
+)
 class TraceParseIjsonTestCase(TraceParseTestCase):
-    vision_transformer_t: Trace
-    vision_transformer_raw_df: pd.DataFrame
-    inference_t: Trace
-    inference_raw_df: pd.DataFrame
-
     @classmethod
     def setUpClass(cls):
         set_default_trace_parsing_backend("ijson_batch_and_compress")
@@ -139,6 +140,13 @@ class TraceParseIjsonTestCase(TraceParseTestCase):
     @classmethod
     def tearDownClass(cls):
         set_default_trace_parsing_backend("json")
+
+    # @mock.patch('ijson.backend')
+    # def test_optimal_backend_detection(self, mock_backend) -> None:
+    #     mock_backend = "xxx"
+    #     self.assertEqual(_auto_detect_parser_backend(), "json")
+    #     mock_backend = "yajl_2c"
+    #     self.assertEqual(_auto_detect_parser_backend(), "ijson_batch_and_compress")
 
 
 if __name__ == "__main__":  # pragma: no cover
