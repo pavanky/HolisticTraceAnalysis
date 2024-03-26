@@ -22,16 +22,17 @@ from hta.configs.parser_config import AttributeSpec, ParserConfig, ValueType
 # from memory_profiler import profile
 
 MetaData = Dict[str, Any]
-TRACE_PARSING_BACKEND: str = "ijson_batched_ofc"
+_TRACE_PARSING_BACKEND: str = "json"
+# _TRACE_PARSING_BACKEND: str = "ijson_batch_and_compress"
 
 
 def set_default_trace_parsing_backend(backend: str):
-    global TRACE_PARSING_BACKEND
-    TRACE_PARSING_BACKEND = backend
+    global _TRACE_PARSING_BACKEND
+    _TRACE_PARSING_BACKEND = backend
 
 
 def get_default_trace_parsing_backend() -> str:
-    return TRACE_PARSING_BACKEND
+    return _TRACE_PARSING_BACKEND
 
 
 # @profile
@@ -296,8 +297,13 @@ def parse_trace_dataframe(
         JSONDecodeError when the trace file is not a valid JSON document.
         ValueError if parser config passes invalid parser backend.
     """
-    parser_backend: str = get_default_trace_parsing_backend()
-    trace_memory = False
+    trace_memory = cfg.trace_memory
+    parser_backend: str = ""
+    if cfg.parser_backend is None:
+        parser_backend = get_default_trace_parsing_backend()
+    else:
+        parser_backend = cfg.parser_backend
+
     t_start = time.perf_counter()
     if trace_memory:
         tracemalloc.start()
@@ -312,7 +318,7 @@ def parse_trace_dataframe(
         meta, df, local_symbol_table = _parse_trace_dataframe_ijson_batched(
             trace_file_path, cfg
         )
-    elif parser_backend == "ijson_batched_ofc":
+    elif parser_backend == "ijson_batch_and_compress":
         meta, df, local_symbol_table = _parse_trace_dataframe_ijson_batched(
             trace_file_path, cfg, compress_on_fly=True
         )

@@ -8,7 +8,10 @@ import unittest
 import pandas as pd
 
 from hta.common.trace import parse_trace_dict, Trace
-from hta.common.trace_parser import get_default_trace_parsing_backend
+from hta.common.trace_parser import (
+    get_default_trace_parsing_backend,
+    set_default_trace_parsing_backend,
+)
 
 
 class TraceParseTestCase(unittest.TestCase):
@@ -120,6 +123,22 @@ class TraceParseTestCase(unittest.TestCase):
             self.assertDictEqual(
                 gpu_kernels_per_iteration, correlated_cpu_ops_per_iteration
             )
+
+
+class TraceParseIjsonTestCase(TraceParseTestCase):
+    vision_transformer_t: Trace
+    vision_transformer_raw_df: pd.DataFrame
+    inference_t: Trace
+    inference_raw_df: pd.DataFrame
+
+    @classmethod
+    def setUpClass(cls):
+        set_default_trace_parsing_backend("ijson_batch_and_compress")
+        super(TraceParseIjsonTestCase, cls).setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        set_default_trace_parsing_backend("json")
 
 
 if __name__ == "__main__":  # pragma: no cover
