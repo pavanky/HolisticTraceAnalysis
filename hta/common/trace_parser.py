@@ -11,8 +11,6 @@ import time
 import tracemalloc
 from typing import Any, Dict, Optional, Tuple
 
-import ijson
-
 import pandas as pd
 from hta.common.trace_symbol_table import TraceSymbolTable
 
@@ -65,6 +63,19 @@ def parse_trace_dict(trace_file_path: str) -> Dict[str, Any]:
 
 # @profile
 def _parse_trace_events_ijson(trace_file_path: str) -> pd.DataFrame:
+    """
+    Parse the trace file using iterative json.
+
+    Args:
+        trace_file_path (str) : the path to a trace file.
+
+    Returns:
+        pd.DataFrame: parsed trace dataframe.
+    """
+    import ijson
+
+    logger.info(f"Parsing using ijson (ijson backend = {ijson.backend})")
+
     t_start = time.perf_counter()
     with (
         gzip.open(trace_file_path, "rb")
@@ -74,9 +85,9 @@ def _parse_trace_events_ijson(trace_file_path: str) -> pd.DataFrame:
 
         iterator = ijson.items(fh, "traceEvents.item", use_float=True)
 
-        # this version ignore python function tracer
+        # Ignore python function tracer
+        # TODO make this filter configuration in ParserConfig
         df = pd.DataFrame(e for e in iterator if e.get("cat") != "python_function")
-        # df = pd.DataFrame(iterator)
 
     t_end = time.perf_counter()
     logger.warning(
@@ -88,10 +99,23 @@ def _parse_trace_events_ijson(trace_file_path: str) -> pd.DataFrame:
 def _parse_trace_events_ijson_batched(
     trace_file_path: str, cfg: ParserConfig, compress_on_fly: bool = False
 ) -> pd.DataFrame:
+    """
+    Parse the trace file using iterative json in batches.
+
+    Args:
+        trace_file_path (str): the path to a trace file.
+        compress_on_fly (bool): parse "args" on the fly.
+
+    Returns:
+        pd.DataFrame: parsed trace dataframe.
+    """
+    import ijson
+
+    logger.info(f"Parsing using ijson (ijson backend = {ijson.backend})")
 
     arg_name_map = {arg.raw_name: arg.name for arg in cfg.get_args()}
     args_to_keep = arg_name_map.keys()
-    # logger.warning(f"arg_name_map = {arg_name_map}")
+    logger.debug(f"arg_name_map = {arg_name_map}")
 
     def trim_event(e):
         if "args" not in e:
@@ -112,7 +136,7 @@ def _parse_trace_events_ijson_batched(
         if trace_file_path.endswith(".gz")
         else open(trace_file_path, "rb")
     ) as fh:
-
+        # TODO make events to skip configurable in ParserConfig
         iterator = (
             e
             for e in ijson.items(fh, "traceEvents.item", use_float=True)
@@ -121,6 +145,7 @@ def _parse_trace_events_ijson_batched(
         if compress_on_fly:
             iterator = (trim_event(e) for e in iterator)
 
+        # XXX Currently using 1000 as batch size.
         batch_size = 1000
         batch = []
         dfs = []
@@ -226,6 +251,15 @@ def _compress_df(
 def _parse_trace_dataframe_json(
     trace_file_path: str, cfg: ParserConfig
 ) -> Tuple[MetaData, pd.DataFrame, TraceSymbolTable]:
+    """
+    Parse the trace file into dataframe.
+
+    Args:
+        trace_file_path (str) : the path to a trace file.
+
+    Returns:
+        pd.DataFrame: parsed trace dataframe.
+    """
     trace_record = parse_trace_dict(trace_file_path)
     meta: Dict[str, Any] = {k: v for k, v in trace_record.items() if k != "traceEvents"}
     df: pd.DataFrame = pd.DataFrame()
@@ -244,31 +278,30 @@ def _parse_trace_dataframe_json(
 
 # @profile
 def _parse_trace_dataframe_ijson(
-    trace_file_path: str, cfg: ParserConfig
+    trace_file_path: str,
+    cfg: ParserConfig,
+    batched: bool = False,
+    compress_on_fly: bool = False,
 ) -> Tuple[MetaData, pd.DataFrame, TraceSymbolTable]:
-    # TODO print backend
+    """
+    Parse the trace file using iterative json, supports multiple modes below.
+
+    Args:
+        trace_file_path (str): the path to a trace file.
+        batched (bool): use batching
+        compress_on_fly (bool): parse "args" on the fly.
+
+    Returns:
+        pd.DataFrame: parsed trace dataframe.
+    """
     meta: Dict[str, Any] = {}
+    # XXX handle adding metadata
     # k: v for k, v in trace_record.items() if k != "traceEvents"}
 
-    df = _parse_trace_events_ijson(trace_file_path)
-
-    # assign an index to each event
-    df.reset_index(inplace=True)
-    df["index"] = pd.to_numeric(df["index"], downcast="integer")
-
-    df, local_symbol_table = _compress_df(df, cfg)
-    return meta, df, local_symbol_table
-
-
-# @profile
-def _parse_trace_dataframe_ijson_batched(
-    trace_file_path: str, cfg: ParserConfig, compress_on_fly: bool = False
-) -> Tuple[MetaData, pd.DataFrame, TraceSymbolTable]:
-    # TODO print backend
-    meta: Dict[str, Any] = {}
-    # k: v for k, v in trace_record.items() if k != "traceEvents"}
-
-    df = _parse_trace_events_ijson_batched(trace_file_path, cfg, compress_on_fly)
+    if batched:
+        df = _parse_trace_events_ijson_batched(trace_file_path, cfg, compress_on_fly)
+    else:
+        df = _parse_trace_events_ijson(trace_file_path)
 
     # assign an index to each event
     df.reset_index(inplace=True)
@@ -282,7 +315,7 @@ def parse_trace_dataframe(
     trace_file_path: str,
     cfg: ParserConfig,
 ) -> Tuple[MetaData, pd.DataFrame, TraceSymbolTable]:
-    """parse a single trace file into a meat test_data dictionary and a dataframe of events.
+    """Parse a single trace file into a meat test_data dictionary and a dataframe of events.
     Args:
         trace_file_path (str): The path to a trace file. When the trace_file is a relative path.
             This method combines the object's trace_path with trace_file to get the full path of the trace file.
@@ -315,12 +348,14 @@ def parse_trace_dataframe(
             trace_file_path, cfg
         )
     elif parser_backend == "ijson_batched":
-        meta, df, local_symbol_table = _parse_trace_dataframe_ijson_batched(
-            trace_file_path, cfg
+        meta, df, local_symbol_table = _parse_trace_dataframe_ijson(
+            trace_file_path,
+            cfg,
+            batched=True,
         )
     elif parser_backend == "ijson_batch_and_compress":
-        meta, df, local_symbol_table = _parse_trace_dataframe_ijson_batched(
-            trace_file_path, cfg, compress_on_fly=True
+        meta, df, local_symbol_table = _parse_trace_dataframe_ijson(
+            trace_file_path, cfg, batched=True, compress_on_fly=True
         )
     else:
         raise ValueError(f"unexpected or unsupported parser = {parser_backend}")
